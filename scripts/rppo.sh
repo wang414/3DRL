@@ -1,0 +1,1 @@
+python rnn_training.py -e PickSingleYCB-v0 --total-timesteps 5000000 --log-dir logs/test_vec

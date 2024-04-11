@@ -11,6 +11,8 @@ from mani_skill2.utils.wrappers.observation import (
     PointCloudObservationWrapper,
     RGBDObservationWrapper,
     RobotSegmentationObservationWrapper,
+    ObjectSegmentationObservationWrapper,
+    PointCloudAndRGBDObservationWrapper,
 )
 
 
@@ -96,10 +98,14 @@ def make(env_id, as_gym=True, enable_segmentation=False, **kwargs):
         env = RGBDObservationWrapper(env)
     elif "pointcloud" in obs_mode:
         env = PointCloudObservationWrapper(env)
+    elif "all" in obs_mode:
+        env = PointCloudAndRGBDObservationWrapper(env)
 
     # Add robot segmentation wrapper
     if "robot_seg" in obs_mode:
         env = RobotSegmentationObservationWrapper(env)
+    elif "obj_seg" in obs_mode:
+        env = ObjectSegmentationObservationWrapper(env)
 
     # Set observation mode on the wrapper
     if isinstance(env, gym.Wrapper):
