@@ -44,7 +44,7 @@ if __name__=="__main__":
   # masks = np.stack(masks, axis=0)
   # depth = np.stack(depth, axis=0)
   # K = np.loadtxt(os.path.join(args.video_dir, 'cam_K.txt')).reshape(3,3)
-  rgbs = load_data['rgbs'].copy()
+  rgbs = load_data['rgbs'][:,:,:,::-1].copy()
   depth = load_data['depths'].copy()
   masks = load_data['masks'].copy()
   K = load_data['K'].copy()

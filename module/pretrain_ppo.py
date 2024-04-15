@@ -310,15 +310,15 @@ class RecurrentPPO(OnPolicyAlgorithm):
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device), lstm_states.vf, episode_starts)
         if self.reward_callback is not None:
             bs=self.reward_callback(rollout_buffer)
-            self.logger.record("rollout/compute_succ_times", bs)
+            self.logger.record("my/compute_succ_times", bs)
             if rollout_buffer.rewards.sum() > 0:
-                self.logger.record("rollout/my_reward_mean", rollout_buffer.rewards.sum()/((rollout_buffer.rewards>0).sum()))
-                self.logger.record("rollout/my_reward_max", np.max(rollout_buffer.rewards))
-                self.logger.record("rollout/my_reward_min", np.min(rollout_buffer.rewards[rollout_buffer.rewards>0]))
+                self.logger.record("my/reward_mean", rollout_buffer.rewards.sum()/((rollout_buffer.rewards>0).sum()))
+                self.logger.record("my/my_reward_max", np.max(rollout_buffer.rewards))
+                self.logger.record("my/my_reward_min", np.min(rollout_buffer.rewards[rollout_buffer.rewards>0]))
             else:
-                self.logger.record("rollout/my_reward_mean", 0)
-                self.logger.record("rollout/my_reward_max", 0)
-                self.logger.record("rollout/my_reward_min", 0)
+                self.logger.record("my/my_reward_mean", -10)
+                self.logger.record("my/my_reward_max", -10)
+                self.logger.record("my/my_reward_min", -10)
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
         callback.on_rollout_end()
 
