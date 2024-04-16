@@ -26,7 +26,7 @@ from mani_skill2.vector import make as make_vec_env
 from mani_skill2.vector.vec_env import VecEnvObservationWrapper
 from mani_skill2.vector.wrappers.sb3 import SB3VecEnvWrapper
 from torchvision.models import resnet18
-from pointnet2.models.pointnet2_ssg_cls import PointNet2ClassificationSSG
+# from pointnet2.models.pointnet2_ssg_cls import PointNet2ClassificationSSG
 import open3d as o3d
 import subprocess, threading
 from PyTorchEMD import earth_mover_distance
@@ -87,6 +87,8 @@ class PretrainWrapper(gym.ObservationWrapper):
 
         # Create the new observation space
         return spaces.Dict({"rgb": rgb_space, "depth":depth_space, "mask":mask_space, "state": state_space})
+        # return spaces.Dict({"rgb": rgb_space, "depth":depth_space, "mask":mask_space, "state": state_space})
+
 
     @staticmethod
     def convert_observation(observation):
@@ -217,10 +219,10 @@ class RewardCallback:
         os.system(f'rm -rf .tmp && mkdir .tmp')
         self.K = K
         self.stride = stride
-        self.model = PointNet2ClassificationSSG({'model.use_xyz':True})
-        self.model.load_from_checkpoint(pointnet_path)
-        self.model = self.model.to('cuda')
-        self.model.eval()
+        # self.model = PointNet2ClassificationSSG({'model.use_xyz':True})
+        # self.model.load_from_checkpoint(pointnet_path)
+        # self.model = self.model.to('cuda')
+        # self.model.eval()
         with open('data/mani_skill2_ycb/info_pick_v0.json', 'r') as f:
             obj_dict = json.load(f)
         data_dir = 'data/mani_skill2_ycb/models'
@@ -271,6 +273,8 @@ class RewardCallback:
         os.system(f"mkdir {os.path.join(tmp_dir, 'input')}")
         depths = depths.squeeze(-1)
         masks = masks.squeeze(-1)
+        mask_rew = masks.sum()*5/(128*128)
+        mask_rew_clip = max(min(mask_rew, 5), 0)
         idxs = self.sample_idx(rgbs.shape[0])
         # print(idxs)
         rgbs = (rgbs[idxs,:,:,3:] * 255).astype(np.uint8)
@@ -288,23 +292,28 @@ class RewardCallback:
         build_succ = True
         if os.path.exists(pcd_path):
             pcd = o3d.io.read_point_cloud(pcd_path)
-            gt_pcd = self.gt_pcds[obj]
-            # chamfer_dis = pcd.compute_point_cloud_distance(gt_pcd)
-            # chamfer_dis = np.asarray(chamfer_dis).sum().item()
-            pcd = np.asarray(pcd.points, dtype=np.float32)
-            pcd = th.tensor(pcd, device='cuda').unsqueeze(0)
-            gt_pcd = th.tensor(np.asarray(self.gt_pcds[obj]), device='cuda', dtype=th.float32).unsqueeze(0)
-            emd_dis = earth_mover_distance(pcd, gt_pcd)
+            gt_pcd_np = self.gt_pcds[obj]
+
+            gt_pcd = o3d.geometry.PointCloud()
+            gt_pcd.points = o3d.utility.Vector3dVector(gt_pcd_np)
+            chamfer_dis = pcd.compute_point_cloud_distance(gt_pcd)
+            chamfer_dis = np.asarray(chamfer_dis).sum().item()
+            # pcd = np.asarray(pcd.points, dtype=np.float32)
+            # pcd = th.tensor(pcd, device='cuda').unsqueeze(0)
+            # gt_pcd = th.tensor(np.asarray(self.gt_pcds[obj]), device='cuda', dtype=th.float32).unsqueeze(0)
+            # emd_dis = earth_mover_distance(pcd, gt_pcd)
             # ic(chamfer_dis)
             # ic(emd_dis)
-            clip_dis = max(min(emd_dis*200, 10), 0)
+            # print(chamfer_dis)
+            clip_dis_reward = max(min(20 - chamfer_dis*10, 20), 0)
         else:
-            clip_dis = 10
+            clip_dis_reward = 0
             build_succ = False
         # finish2_time = time.time()
         # print(f'construct_time = {finish1_time-start_time}')
         # print(f'dis_time = {finish2_time-finish1_time}')
-        return 10 - clip_dis, build_succ
+        return clip_dis_reward+mask_rew_clip, build_succ
+        # return 10 - clip_dis, build_succ
     
     def reset_buf(self, idx):
         self.rgb_buf[idx] = []
@@ -353,6 +362,7 @@ class RewardCallback:
             threads.append(t)
         for t in threads:
             t.join()
+        th.cuda.empty_cache()
         return self.total_bs
 
     def single_thread(self, rollout_buffer):  
@@ -375,6 +385,7 @@ class RewardCallback:
                     self.reset_buf(i)
                     self.total_bs += bs
         return self.total_bs
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Simple script demonstrating how to use Stable Baselines 3 with ManiSkill2 and RGBD Observations"
@@ -529,12 +540,13 @@ def main():
         n_steps=rollout_steps // num_envs,
         batch_size=400,
         n_epochs=5,
-        gamma=0.8,
+        gamma=0.99,
         target_kl=0.2,
         tensorboard_log=log_dir,
         policy_kwargs=policy_kwargs,
-        # ent_coef=
-        verbose=1,
+        learning_rate=1e-4,
+        # ent_coef=1e-3,
+        # verbose=1,
     )
 
     if args.eval:

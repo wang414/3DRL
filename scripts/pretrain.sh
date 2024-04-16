@@ -1,1 +1,1 @@
-python rnn_pretraining.py -e PickSingleYCB-v0 --total-timesteps 5000000 --log-dir logs/emd_dis_scale_200
+python rnn_pretraining.py -e PickSingleYCB-v0 --total-timesteps 1000000 --log-dir logs/chamfer10_mask10_rollout1600_lr1e-4_testmm

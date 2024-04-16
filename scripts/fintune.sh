@@ -1,0 +1,1 @@
+python rnn_training.py -e PickSingleYCB-v0 --total-timesteps 5000000 --log-dir logs/finetuning_chamfer --model-path logs/chamfer10_mask10_rollout1600_lr1e-4/rl_model_608000_steps.zip
