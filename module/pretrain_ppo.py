@@ -316,9 +316,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
                 self.logger.record("my/my_reward_max", np.max(rollout_buffer.rewards))
                 self.logger.record("my/my_reward_min", np.min(rollout_buffer.rewards[rollout_buffer.rewards>0]))
             else:
-                self.logger.record("my/my_reward_mean", -10)
-                self.logger.record("my/my_reward_max", -10)
-                self.logger.record("my/my_reward_min", -10)
+                self.logger.record("my/my_reward_mean", 0)
+                self.logger.record("my/my_reward_max", 0)
+                self.logger.record("my/my_reward_min", 0)
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
         callback.on_rollout_end()
 
