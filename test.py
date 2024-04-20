@@ -2,7 +2,7 @@
 import argparse
 import os.path as osp
 from functools import partial
-
+import json
 import gymnasium as gym
 import gymnasium.spaces as spaces
 import numpy as np
@@ -11,11 +11,13 @@ import torch.nn as nn
 # from stable_baselines3 import PPO
 from module.recurrent_ppo import RecurrentPPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from stable_baselines3.common.evaluation import evaluate_policy
+from evaluation import evaluate_policy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
-
+import glob
+import re
+import pickle, os
 import mani_skill2.envs
 from mani_skill2.utils.common import flatten_dict_space_keys, flatten_state_dict
 from mani_skill2.utils.wrappers import RecordEpisode
@@ -24,21 +26,7 @@ from mani_skill2.vector import make as make_vec_env
 from mani_skill2.vector.vec_env import VecEnvObservationWrapper
 from mani_skill2.vector.wrappers.sb3 import SB3VecEnvWrapper
 from torchvision.models import resnet18
-
-
-# Defines a continuous, infinite horizon, task where terminated is always False
-# unless a timelimit is reached.
-class ContinuousTaskWrapper(gym.Wrapper):
-    def __init__(self, env) -> None:
-        super().__init__(env)
-
-    def reset(self, *args, **kwargs):
-        return super().reset(*args, **kwargs)
-
-    def step(self, action):
-        ob, rew, terminated, truncated, info = super().step(action)
-        return ob, rew, False, truncated, info
-
+from stable_baselines3.common.save_util import load_from_zip_file
 
 # A simple wrapper that adds a is_success key which SB3 tracks
 class SuccessInfoWrapper(gym.Wrapper):
@@ -115,27 +103,11 @@ class ManiSkillRGBDWrapper(gym.ObservationWrapper):
         return self.convert_observation(observation)
 
 
-# We separately define an VecEnv observation wrapper for the ManiSkill VecEnv
-# as the gpu optimization makes it incompatible with the SB3 wrapper
-class ManiSkillRGBDVecEnvWrapper(VecEnvObservationWrapper):
-    def __init__(self, env):
-        assert env.obs_mode == "rgbd"
-        # we simply define the single env observation space. The inherited wrapper automatically computes the batched version
-        single_observation_space = ManiSkillRGBDWrapper.init_observation_space(
-            env.single_observation_space
-        )
-        super().__init__(env, single_observation_space)
-
-    def observation(self, observation):
-        return ManiSkillRGBDWrapper.convert_observation(observation)
-
-
 class CustomExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict):
+    def __init__(self, observation_space: gym.spaces.Dict, emb_module='CNN'):
         super().__init__(observation_space, features_dim=1)
-
         extractors = {}
-
+        assert emb_module in ['CNN', 'resnet'], 'embedding module not define'
         total_concat_size = 0
         feature_size = 128
 
@@ -145,37 +117,39 @@ class CustomExtractor(BaseFeaturesExtractor):
             if key == "rgb":
                 # here we use a NatureCNN architecture to process images, but any architecture is permissble here
                 in_channels = subspace.shape[-1]
-                cnn = nn.Sequential(
-                    nn.Conv2d(
-                        in_channels=in_channels,
-                        out_channels=32,
-                        kernel_size=8,
-                        stride=4,
-                        padding=0,
-                    ),
-                    nn.ReLU(),
-                    nn.Conv2d(
-                        in_channels=32,
-                        out_channels=64,
-                        kernel_size=4,
-                        stride=2,
-                        padding=0,
-                    ),
-                    nn.ReLU(),
-                    nn.Conv2d(
-                        in_channels=64,
-                        out_channels=64,
-                        kernel_size=3,
-                        stride=1,
-                        padding=0,
-                    ),
-                    nn.ReLU(),
-                    nn.Flatten(),
-                )
-                # cnn = resnet18(pretrained=True)
-                # cnn.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-                # num_ftrs = cnn.fc.in_features
-                # cnn.fc = nn.Linear(num_ftrs, feature_size)    
+                if emb_module == 'CNN':
+                    cnn = nn.Sequential(
+                        nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=32,
+                            kernel_size=8,
+                            stride=4,
+                            padding=0,
+                        ),
+                        nn.ReLU(),
+                        nn.Conv2d(
+                            in_channels=32,
+                            out_channels=64,
+                            kernel_size=4,
+                            stride=2,
+                            padding=0,
+                        ),
+                        nn.ReLU(),
+                        nn.Conv2d(
+                            in_channels=64,
+                            out_channels=64,
+                            kernel_size=3,
+                            stride=1,
+                            padding=0,
+                        ),
+                        nn.ReLU(),
+                        nn.Flatten(),
+                    )
+                if emb_module == 'resnet':
+                    cnn = resnet18(pretrained=True)
+                    cnn.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+                    num_ftrs = cnn.fc.in_features
+                    cnn.fc = nn.Linear(num_ftrs, feature_size)    
                 # to easily figure out the dimensions after flattening, we pass a test tensor
                 test_tensor = th.zeros(
                     [subspace.shape[2], subspace.shape[0], subspace.shape[1]]
@@ -193,7 +167,6 @@ class CustomExtractor(BaseFeaturesExtractor):
 
         self.extractors = nn.ModuleDict(extractors)
         self._features_dim = total_concat_size
-
     def forward(self, observations) -> th.Tensor:
         encoded_tensor_list = []
         # self.extractors contain nn.Modules that do all the processing.
@@ -203,70 +176,19 @@ class CustomExtractor(BaseFeaturesExtractor):
             encoded_tensor_list.append(extractor(observations[key]))
         # Return a (B, self._features_dim) PyTorch tensor, where B is batch dimension.
         return th.cat(encoded_tensor_list, dim=1)
+    
 
+def eval(model_path, model_id=None):
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Simple script demonstrating how to use Stable Baselines 3 with ManiSkill2 and RGBD Observations"
-    )
-    parser.add_argument("-e", "--env-id", type=str, default="LiftCube-v0")
-    parser.add_argument(
-        "-n",
-        "--n-envs",
-        type=int,
-        default=8,
-        help="number of parallel envs to run. Note that increasing this does not increase rollout size",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        help="Random seed to initialize training with",
-    )
-    parser.add_argument(
-        "--max-episode-steps",
-        type=int,
-        default=50,
-        help="Max steps per episode before truncating them",
-    )
-    parser.add_argument(
-        "--total-timesteps",
-        type=int,
-        default=256_000,
-        help="Total timesteps for training",
-    )
-    parser.add_argument(
-        "--log-dir",
-        type=str,
-        default="logs",
-        help="path for where logs, checkpoints, and videos are saved",
-    )
-    parser.add_argument(
-        "--eval", action="store_true", help="whether to only evaluate policy"
-    )
-    parser.add_argument(
-        "--model-path", type=str, help="path to sb3 model for evaluation"
-    )
-    args = parser.parse_args()
-    return args
-
-
-def main():
-    args = parse_args()
-
-    env_id = args.env_id
-    num_envs = args.n_envs
-    log_dir = args.log_dir
-    max_episode_steps = args.max_episode_steps
-    total_timesteps = args.total_timesteps
+    env_id = "PickSingleYCB-v0"
+    log_dir = None
+    max_episode_steps = 50
     rollout_steps = 3200
 
     obs_mode = "rgbd"
     # NOTE: The end-effector space controller is usually more friendly to pick-and-place tasks
     control_mode = "pd_ee_delta_pose"
     use_ms2_vec_env = False
-
-    if args.seed is not None:
-        set_random_seed(args.seed)
 
     # define a make_env function for Stable Baselines
     def make_env(
@@ -283,11 +205,8 @@ def main():
             control_mode=control_mode,
             render_mode="cameras",
             max_episode_steps=max_episode_steps,
+            model_ids = model_id,
         )
-        # For training, we regard the task as a continuous task with infinite horizon.
-        # you can use the ContinuousTaskWrapper here for that
-        if max_episode_steps is not None:
-            env = ContinuousTaskWrapper(env)
         env = ManiSkillRGBDWrapper(env)
         # For evaluation, we record videos
         if record_dir is not None:
@@ -301,49 +220,21 @@ def main():
         return env
 
     # Create an environment for evaluation
-    if args.eval:
-        record_dir = osp.join(log_dir, "videos/eval")
-    else:
-        record_dir = osp.join(log_dir, "videos")
+    record_dir = None
+    
     env_fn = partial(
         make_env,
         env_id,
         record_dir=record_dir,
+        max_episode_steps = max_episode_steps
     )
-    eval_env = SubprocVecEnv([env_fn for _ in range(1)])
+    eval_env = SubprocVecEnv([env_fn for _ in range(5)])
     eval_env = VecMonitor(eval_env)  # Attach a monitor to log episode info
-    eval_env.seed(seed=args.seed)
+    # eval_env.seed(int(time.time())%99991)
+    # print(time.time())
     eval_env.reset()
-
-    if args.eval:
-        env = eval_env
-    else:
-        # Create vectorized environments for training
-        if use_ms2_vec_env:
-            env: VecEnv = make_vec_env(
-                env_id,
-                num_envs,
-                obs_mode=obs_mode,
-                control_mode=control_mode,
-                wrappers=[partial(ContinuousTaskWrapper)],
-                max_episode_steps=max_episode_steps,
-            )
-            env = ManiSkillRGBDVecEnvWrapper(env)
-            env = SB3VecEnvWrapper(
-                env
-            )  # makes MS2VecEnvs compatible with SB3. It's equivalent to SubprocVecEnv
-        else:
-            print('use second vec method')
-            env_fn = partial(
-                make_env,
-                env_id,
-                max_episode_steps=max_episode_steps,
-            )
-            env = SubprocVecEnv([env_fn for _ in range(num_envs)])
-        # Attach a monitor to log episode info
-        env = VecMonitor(env)
-        env.seed(seed=args.seed)  # Note SB3 vec envs don't use the gymnasium API
-        env.reset()
+    # return
+    env = eval_env
     # Define the policy configuration and algorithm configuration
     policy_kwargs = dict(
         features_extractor_class=CustomExtractor, net_arch=[256, 128], log_std_init=-0.5
@@ -351,7 +242,7 @@ def main():
     model = RecurrentPPO(
         "MultiInputLstmPolicy",
         env,
-        n_steps=rollout_steps // num_envs,
+        # n_steps=rollout_steps // num_envs,
         batch_size=400,
         n_epochs=5,
         gamma=0.8,
@@ -361,52 +252,57 @@ def main():
         verbose=1,
     )
 
-    if args.eval:
-        model_path = args.model_path
-        if model_path is None:
-            model_path = osp.join(log_dir, "latest_model")
-        # Load the saved model
-        model = model.load(model_path)
-    else:
-        # Define callbacks to periodically save our model and evaluate it to help monitor training
-        checkpoint_callback = CheckpointCallback(
-            save_freq=50 * rollout_steps // num_envs,
-            save_path=log_dir,
-        )
-        eval_callback = EvalCallback(
-            eval_env,
-            eval_freq=50 * rollout_steps // num_envs,
-            log_path=log_dir,
-            best_model_save_path=log_dir,
-            deterministic=True,
-            render=False,
-        )
-
-        # Train an agent with PPO
-        model.learn(total_timesteps, log_interval=50, callback=[checkpoint_callback, eval_callback])
-        # Save the final model
-        model.save(osp.join(log_dir, "latest_model"))
-
-    # Evaluate the model
-    returns, ep_lens = evaluate_policy(
+    model_path = model_path
+    # Load the saved model
+    model.set_parameters(model_path)
+        # Evaluate the model
+    returns, max_rewards = evaluate_policy(
         model,
         eval_env,
         deterministic=True,
         render=False,
         return_episode_rewards=True,
-        n_eval_episodes=10,
+        n_eval_episodes=5,
     )
-    print("Returns", returns)
-    print("Episode Lengths", ep_lens)
-    success = np.array(ep_lens) < 200
-    success_rate = success.mean()
-    print("Success Rate:", success_rate)
-
+    # print("Returns", returns)
+    # print("Episode Lengths", ep_lens)
+    # print("max_rewards", max_rewards)
     # close all envs
     eval_env.close()
-    if not args.eval:
-        env.close()
+    return returns, max_rewards
+   
+with open('data/mani_skill2_ycb/info_pick_v0.json', 'r') as f:
+    obj_dict = json.load(f)
 
+def eval_all_obj(model_path):
+    result = {}
+    for key in obj_dict.keys():
+        me, ma = eval(model_path=model_path, model_id=key)
+        result[key] = [me, ma]
+    return result
+
+def extract_number(filename):
+    match = re.search(r'rl_model_(\d+)_steps.zip', filename)
+    if match:
+        return int(match.group(1))
+    return None 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input_folder', type=str)
+    args = parser.parse_args()
+    folder_path = args.input_folder
+    pattern = f"{folder_path}/rl_model_*_steps.zip"
+    matching_files = glob.glob(pattern)
+
+    sorted_files = sorted(matching_files, key=extract_number)
+
+    timesteps = []
+    results = []
+    for file in sorted_files:
+        timesteps.append(extract_number(file))
+        res = eval_all_obj(file)
+        results.append(res)
+
+    with open(os.path.join(folder_path, 'eval_data.pkl'), 'wb') as f:
+        pickle.dump({'result':results, 'timesteps':timesteps}, f)

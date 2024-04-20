@@ -11,7 +11,7 @@ import torch.nn as nn
 # from stable_baselines3 import PPO
 from module.recurrent_ppo import RecurrentPPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from stable_baselines3.common.evaluation import evaluate_policy
+from evaluation import evaluate_policy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
@@ -24,7 +24,7 @@ from mani_skill2.vector import make as make_vec_env
 from mani_skill2.vector.vec_env import VecEnvObservationWrapper
 from mani_skill2.vector.wrappers.sb3 import SB3VecEnvWrapper
 from torchvision.models import resnet18
-
+from stable_baselines3.common.save_util import load_from_zip_file
 
 # Defines a continuous, infinite horizon, task where terminated is always False
 # unless a timelimit is reached.
@@ -78,7 +78,7 @@ class ManiSkillRGBDWrapper(gym.ObservationWrapper):
         rgbd_space = spaces.Box(0, np.inf, shape=(h, w, c))
 
         # Create the new observation space
-        return spaces.Dict({"rgbd": rgbd_space, "state": state_space})
+        return spaces.Dict({"rgb": rgbd_space, "state": state_space})
 
     @staticmethod
     def convert_observation(observation):
@@ -109,7 +109,7 @@ class ManiSkillRGBDWrapper(gym.ObservationWrapper):
             ]
         )
 
-        return dict(rgbd=rgbd, state=state)
+        return dict(rgb=rgbd, state=state)
 
     def observation(self, observation):
         return self.convert_observation(observation)
@@ -131,51 +131,52 @@ class ManiSkillRGBDVecEnvWrapper(VecEnvObservationWrapper):
 
 
 class CustomExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict):
+    def __init__(self, observation_space: gym.spaces.Dict, emb_module='CNN'):
         super().__init__(observation_space, features_dim=1)
-
         extractors = {}
-
+        assert emb_module in ['CNN', 'resnet'], 'embedding module not define'
         total_concat_size = 0
         feature_size = 128
 
         for key, subspace in observation_space.spaces.items():
             # We go through all subspaces in the observation space.
             # We know there will only be "rgbd" and "state", so we handle those below
-            if key == "rgbd":
+            if key == "rgb":
                 # here we use a NatureCNN architecture to process images, but any architecture is permissble here
                 in_channels = subspace.shape[-1]
-                cnn = nn.Sequential(
-                    nn.Conv2d(
-                        in_channels=in_channels,
-                        out_channels=32,
-                        kernel_size=8,
-                        stride=4,
-                        padding=0,
-                    ),
-                    nn.ReLU(),
-                    nn.Conv2d(
-                        in_channels=32,
-                        out_channels=64,
-                        kernel_size=4,
-                        stride=2,
-                        padding=0,
-                    ),
-                    nn.ReLU(),
-                    nn.Conv2d(
-                        in_channels=64,
-                        out_channels=64,
-                        kernel_size=3,
-                        stride=1,
-                        padding=0,
-                    ),
-                    nn.ReLU(),
-                    nn.Flatten(),
-                )
-                # cnn = resnet18(pretrained=True)
-                # cnn.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-                # num_ftrs = cnn.fc.in_features
-                # cnn.fc = nn.Linear(num_ftrs, feature_size)    
+                if emb_module == 'CNN':
+                    cnn = nn.Sequential(
+                        nn.Conv2d(
+                            in_channels=in_channels,
+                            out_channels=32,
+                            kernel_size=8,
+                            stride=4,
+                            padding=0,
+                        ),
+                        nn.ReLU(),
+                        nn.Conv2d(
+                            in_channels=32,
+                            out_channels=64,
+                            kernel_size=4,
+                            stride=2,
+                            padding=0,
+                        ),
+                        nn.ReLU(),
+                        nn.Conv2d(
+                            in_channels=64,
+                            out_channels=64,
+                            kernel_size=3,
+                            stride=1,
+                            padding=0,
+                        ),
+                        nn.ReLU(),
+                        nn.Flatten(),
+                    )
+                if emb_module == 'resnet':
+                    cnn = resnet18(pretrained=True)
+                    cnn.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
+                    num_ftrs = cnn.fc.in_features
+                    cnn.fc = nn.Linear(num_ftrs, feature_size)    
                 # to easily figure out the dimensions after flattening, we pass a test tensor
                 test_tensor = th.zeros(
                     [subspace.shape[2], subspace.shape[0], subspace.shape[1]]
@@ -183,7 +184,7 @@ class CustomExtractor(BaseFeaturesExtractor):
                 with th.no_grad():
                     n_flatten = cnn(test_tensor[None]).shape[1]
                 fc = nn.Sequential(nn.Linear(n_flatten, feature_size), nn.ReLU())
-                extractors["rgbd"] = nn.Sequential(cnn, fc)
+                extractors["rgb"] = nn.Sequential(cnn, fc)
                 total_concat_size += feature_size
             elif key == "state":
                 # for state data we simply pass it through a single linear layer
@@ -193,12 +194,11 @@ class CustomExtractor(BaseFeaturesExtractor):
 
         self.extractors = nn.ModuleDict(extractors)
         self._features_dim = total_concat_size
-
     def forward(self, observations) -> th.Tensor:
         encoded_tensor_list = []
         # self.extractors contain nn.Modules that do all the processing.
         for key, extractor in self.extractors.items():
-            if key == "rgbd":
+            if key == "rgb":
                 observations[key] = observations[key].permute((0, 3, 1, 2))
             encoded_tensor_list.append(extractor(observations[key]))
         # Return a (B, self._features_dim) PyTorch tensor, where B is batch dimension.
@@ -363,39 +363,33 @@ def main():
 
 
         # Define callbacks to periodically save our model and evaluate it to help monitor training
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10 * rollout_steps // num_envs,
+    
+    if args.eval:
+        model_path = args.model_path
+        if model_path is None:
+            model_path = osp.join(log_dir, "latest_model")
+        # Load the saved model
+        model = model.load(model_path)
+    else:
+        assert args.model_path is not None, 'no model path'
+        checkpoint_callback = CheckpointCallback(
+        save_freq=50 * rollout_steps // num_envs,
         save_path=log_dir,
-    )
-    eval_callback = EvalCallback(
-        eval_env,
-        eval_freq=10 * rollout_steps // num_envs,
-        log_path=log_dir,
-        best_model_save_path=log_dir,
-        deterministic=True,
-        render=False,
-    )
-    assert args.model_path is not None, 'no model path'
-    model = model.load(args.model_path)
-    # Train an agent with PPO
-    model.learn(total_timesteps, log_interval=10, callback=[checkpoint_callback, eval_callback])
-    # Save the final model
-    model.save(osp.join(log_dir, "latest_model"))
-
-    # Evaluate the model
-    returns, ep_lens = evaluate_policy(
-        model,
-        eval_env,
-        deterministic=True,
-        render=False,
-        return_episode_rewards=True,
-        n_eval_episodes=10,
-    )
-    print("Returns", returns)
-    print("Episode Lengths", ep_lens)
-    success = np.array(ep_lens) < 200
-    success_rate = success.mean()
-    print("Success Rate:", success_rate)
+        )
+        eval_callback = EvalCallback(
+            eval_env,
+            eval_freq=50 * rollout_steps // num_envs,
+            log_path=log_dir,
+            best_model_save_path=log_dir,
+            deterministic=True,
+            render=False,
+        )
+        print(f'set {args.model_path} parameters to model')
+        model.set_parameters(args.model_path)
+        # Train an agent with PPO
+        model.learn(total_timesteps, log_interval=50, callback=[checkpoint_callback, eval_callback])
+        # Save the final model
+        model.save(osp.join(log_dir, "latest_model"))
 
     # close all envs
     eval_env.close()
