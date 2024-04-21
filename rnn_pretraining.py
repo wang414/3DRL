@@ -230,6 +230,7 @@ class RewardCallback:
         for key in obj_dict.keys():
             pcd_dir = os.path.join(data_dir, key, 'pcd.ply')
             pcd = o3d.io.read_point_cloud(pcd_dir)
+            pcd = self.normalize_point_cloud(pcd)
             pcd = np.asarray(pcd.points, dtype=np.float32)
             self.gt_pcds[key] = pcd
         self.n_envs = n_envs
@@ -249,22 +250,33 @@ class RewardCallback:
     def sample_idx(self, len):
         # print(len)
         cat_sam = np.random.choice(4, p=[0.3,0.3,0.3,0.1])
+        # 0-20 15
         if cat_sam == 0:
             st = 0
         elif cat_sam == 1:
-            st = 10
+            st = 15
         elif cat_sam == 2:
-            st = 20   
+            st = 30   
         if cat_sam == 3:
             st = 0
             ed = len
         else:
-            ed = min(len, st+30)
+            ed = min(len, st+20)
         l = np.arange(st, ed)
         np.random.shuffle(l)
         l = l[:10]
         l = np.sort(l)
         return l
+
+    @staticmethod
+    def normalize_point_cloud(pc):
+        centroid = pc.get_center()
+        pc.translate(-centroid)
+        distances = np.asarray(pc.points)
+        max_distance = np.max(np.linalg.norm(distances, axis=1))
+        # print(max_distance)
+        pc.scale(1 / max_distance, center=pc.get_center())
+        return pc
 
     def compute(self, rgbs, depths, masks, obj, tmp_dir = './.tmp'):
         
@@ -275,6 +287,7 @@ class RewardCallback:
         masks = masks.squeeze(-1)
         mask_rew = masks.sum()*5/(128*128)
         mask_rew_clip = max(min(mask_rew, 5), 0)
+        mask_rew_clip = 0
         idxs = self.sample_idx(rgbs.shape[0])
         # print(idxs)
         rgbs = (rgbs[idxs,:,:,3:] * 255).astype(np.uint8)
@@ -292,8 +305,8 @@ class RewardCallback:
         build_succ = True
         if os.path.exists(pcd_path):
             pcd = o3d.io.read_point_cloud(pcd_path)
+            pcd = self.normalize_point_cloud(pcd)
             gt_pcd_np = self.gt_pcds[obj]
-
             gt_pcd = o3d.geometry.PointCloud()
             gt_pcd.points = o3d.utility.Vector3dVector(gt_pcd_np)
             chamfer_dis = pcd.compute_point_cloud_distance(gt_pcd)
@@ -306,6 +319,8 @@ class RewardCallback:
             # ic(emd_dis)
             # print(chamfer_dis)
             clip_dis_reward = max(min(20 - chamfer_dis*10, 20), 0)
+            # clip_dis_reward = max(min(20 - emd_dis*10, 20), 0)
+
         else:
             clip_dis_reward = 0
             build_succ = False
@@ -356,8 +371,8 @@ class RewardCallback:
         self.total_bs = 0
         threads = []
         lock = threading.Lock()
-        for i in range(2):
-            t = threading.Thread(target=self.multi_thread_task, args=(rollout_buffer, i, 4, lock))
+        for i in range(8):
+            t = threading.Thread(target=self.multi_thread_task, args=(rollout_buffer, i, 1, lock))
             t.start()
             threads.append(t)
         for t in threads:

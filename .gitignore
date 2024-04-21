@@ -43,3 +43,5 @@ htmlcov/
 logs/
 test_image/
 Pointnet2_PyTorch/
+
+.tmp/
