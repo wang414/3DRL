@@ -9,7 +9,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 # from stable_baselines3 import PPO
-from module.recurrent_ppo import RecurrentPPO
+from module.finetune_ppo import RecurrentPPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from evaluation import evaluate_policy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -385,7 +385,7 @@ def main():
             render=False,
         )
         print(f'set {args.model_path} parameters to model')
-        model.set_parameters(args.model_path)
+        model.set_parameters_policy(args.model_path)
         # Train an agent with PPO
         model.learn(total_timesteps, log_interval=50, callback=[checkpoint_callback, eval_callback])
         # Save the final model
