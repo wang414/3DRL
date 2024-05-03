@@ -86,6 +86,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
         clip_range_vf: Union[None, float, Schedule] = None,
         normalize_advantage: bool = True,
         ent_coef: float = 0.0,
+        norm_coef: float = 0.0,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
@@ -132,6 +133,7 @@ class RecurrentPPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
+        self.norm_coef = norm_coef
         self._last_lstm_states = None
         if _init_setup_model:
             self._setup_model()
@@ -367,7 +369,11 @@ class RecurrentPPO(OnPolicyAlgorithm):
                     rollout_data.lstm_states,
                     rollout_data.episode_starts,
                 )
-
+                actions, _ , _ , _ = self.policy.forward(
+                    rollout_data.observations,
+                    rollout_data.lstm_states,
+                    rollout_data.episode_starts,
+                )
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -410,8 +416,9 @@ class RecurrentPPO(OnPolicyAlgorithm):
                     entropy_loss = -th.mean(entropy[mask])
 
                 entropy_losses.append(entropy_loss.item())
+                norm_loss = actions.abs().sum()
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + self.norm_coef * norm_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417

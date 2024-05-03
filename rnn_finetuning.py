@@ -2,7 +2,7 @@
 import argparse
 import os.path as osp
 from functools import partial
-
+import os, shutil, json
 import gymnasium as gym
 import gymnasium.spaces as spaces
 import numpy as np
@@ -246,6 +246,9 @@ def parse_args():
     parser.add_argument(
         "--model-path", type=str, help="path to sb3 model for evaluation"
     )
+    parser.add_argument(
+        "--policy_only", action="store_true"
+    )
     args = parser.parse_args()
     return args
 
@@ -361,7 +364,12 @@ def main():
         verbose=1,
     )
 
-
+    current_file = os.path.abspath(__file__)
+    backup_file = osp.join(log_dir,"run_file.py")
+    shutil.copy(current_file, backup_file)
+    par_file = osp.join(log_dir, 'args.json')
+    with open(par_file, 'w') as f:
+        json.dump(vars(args), f, indent=4)
         # Define callbacks to periodically save our model and evaluate it to help monitor training
     
     if args.eval:
@@ -385,9 +393,18 @@ def main():
             render=False,
         )
         print(f'set {args.model_path} parameters to model')
-        model.set_parameters_policy(args.model_path)
+        if args.policy_only:
+            print("only set policy")
+            model.set_parameters_policy(args.model_path)
+            warmup_step = 50000
+        else:
+            print("set full par")
+            model.set_parameters(args.model_path)
+            warmup_step = 0
+        
         # Train an agent with PPO
-        model.learn(total_timesteps, log_interval=50, callback=[checkpoint_callback, eval_callback])
+        
+        model.learn(total_timesteps, log_interval=50, callback=[checkpoint_callback, eval_callback], warmup_step=warmup_step)
         # Save the final model
         model.save(osp.join(log_dir, "latest_model"))
 

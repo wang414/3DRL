@@ -2,7 +2,7 @@
 import argparse
 import os.path as osp
 from pathlib import Path
-
+import os
 import gymnasium as gym
 import h5py
 import numpy as np
@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 import mani_skill2.envs
 from mani_skill2.utils.wrappers import RecordEpisode
+import glob
 
 
 def tensor_to_numpy(x):
@@ -52,14 +53,16 @@ def convert_observation(observation):
 
 def rescale_rgbd(rgbd, scale_rgb_only=False):
     # rescales rgbd data and changes them to floats
-    rgb1 = rgbd[..., 0:3] / 255.0
-    rgb2 = rgbd[..., 4:7] / 255.0
-    depth1 = rgbd[..., 3:4]
-    depth2 = rgbd[..., 7:8]
-    if not scale_rgb_only:
-        depth1 = rgbd[..., 3:4] / (2**10)
-        depth2 = rgbd[..., 7:8] / (2**10)
-    return np.concatenate([rgb1, depth1, rgb2, depth2], axis=-1)
+    rgb1 = rgbd[..., :3] / 255.0
+    rgb2 = rgbd[..., 3:] / 255.0
+    # depth1 = rgbd[..., 3:4]
+    # depth2 = rgbd[..., 7:8]
+    # if not scale_rgb_only:
+    #     depth1 = rgbd[..., 3:4] / (2**10)
+    #     depth2 = rgbd[..., 7:8] / (2**10)
+    return np.concatenate([rgb1, rgb2], axis=-1)
+
+    # return np.concatenate([rgb1, depth1, rgb2, depth2], axis=-1)
 
 
 # loads h5 data into memory for faster access
@@ -74,57 +77,101 @@ def load_h5_data(data):
 
 
 class ManiSkill2Dataset(Dataset):
-    def __init__(self, dataset_file: str, load_count=-1) -> None:
-        self.dataset_file = dataset_file
+    def __init__(self, dataset_dir: str) -> None:
+        self.dataset_dir = dataset_dir
         # for details on how the code below works, see the
         # quick start tutorial
+        # self.obs_state = []
+        # self.obs_rgbd = []
+        # self.actions = []
+        self.files = glob.glob(os.path.join(dataset_dir,'*.rgbd.pd_ee_delta_pose.h5'))
+        self.steps_per_obj = np.zeros(len(self.files), dtype=int)
+        self.len_eps_objs = []
+        for idx, file in enumerate(self.files):
+            tt_st, st = self.load_single_obj_info(file)
+            self.steps_per_obj[idx] = tt_st
+            self.len_eps_objs.append(np.cumsum(np.array(st)))
+        self.steps_per_obj = np.cumsum(np.array(self.steps_per_obj))
+
+    def load_single_obj_info(self, dataset_file):
         import h5py
 
         from mani_skill2.utils.io_utils import load_json
-
-        self.data = h5py.File(dataset_file, "r")
+        data = h5py.File(dataset_file, "r")
         json_path = dataset_file.replace(".h5", ".json")
-        self.json_data = load_json(json_path)
-        self.episodes = self.json_data["episodes"]
-        self.env_info = self.json_data["env_info"]
-        self.env_id = self.env_info["env_id"]
-        self.env_kwargs = self.env_info["env_kwargs"]
-
-        self.obs_state = []
-        self.obs_rgbd = []
-        self.actions = []
-        self.total_frames = 0
-        if load_count == -1:
-            load_count = len(self.episodes)
-        for eps_id in tqdm(range(load_count)):
-            eps = self.episodes[eps_id]
-            trajectory = self.data[f"traj_{eps['episode_id']}"]
-            trajectory = load_h5_data(trajectory)
-
-            # convert the original raw observation with our batch-aware function
-            obs = convert_observation(trajectory["obs"])
-            # we use :-1 to ignore the last obs as terminal observations are included
-            # and they don't have actions
-            self.obs_rgbd.append(obs["rgbd"][:-1])
-            self.obs_state.append(obs["state"][:-1])
-            self.actions.append(trajectory["actions"])
-        self.obs_rgbd = np.vstack(self.obs_rgbd)
-        self.obs_state = np.vstack(self.obs_state)
-        self.actions = np.vstack(self.actions)
+        json_data = load_json(json_path)
+        episodes = json_data["episodes"]
+        # env_info = json_data["env_info"]
+        # self.env_id = env_info["env_id"]
+        # self.env_kwargs = env_info["env_kwargs"]
+        total_steps = 0
+        steps = []
+        load_count = len(episodes)
+        for eps_id in range(load_count):
+            eps = episodes[eps_id]
+            steps.append(eps['elapsed_steps'])
+            total_steps+=eps['elapsed_steps']
+            # trajectory = data[f"traj_{eps['episode_id']}"]
+            # trajectory = load_h5_data(trajectory)
+            # # convert the original raw observation with our batch-aware function
+            # obs = convert_observation(trajectory["obs"])
+            # # we use :-1 to ignore the last obs as terminal observations are included
+            # # and they don't have actions
+            # # self.obs_rgbd.append(obs["rgb"][:-1])
+            # # self.obs_state.append(obs["state"][:-1])
+            # # self.actions.append(trajectory["actions"])
+            # print(obs["rgb"].shape)
+            # exit()
+        return total_steps, steps
 
     def __len__(self):
-        return len(self.obs_rgbd)
+        return self.steps_per_obj[-1]
+      
+    def compute_idx(self, idx):
+        obj_id = np.searchsorted(self.steps_per_obj, idx, side='right')
+        if obj_id > 0:
+            idx = idx-self.steps_per_obj[obj_id-1]
+        trj_id = np.searchsorted(self.len_eps_objs[obj_id], idx, side='right')
+        if trj_id > 0:
+            idx = idx - self.len_eps_objs[obj_id][trj_id-1]
+        return obj_id, trj_id, idx
+    
+    def load_step(self, obj_id, trj_id, step_id):
+        import h5py
+        dataset_file = self.files[obj_id]
+        from mani_skill2.utils.io_utils import load_json
+        data = h5py.File(dataset_file, "r")
+        json_path = dataset_file.replace(".h5", ".json")
+        json_data = load_json(json_path)
+        episodes = json_data["episodes"]
+        # env_info = json_data["env_info"]
+        # self.env_id = env_info["env_id"]
+        # self.env_kwargs = env_info["env_kwargs"]
+        eps = episodes[trj_id]
+ 
+        trajectory = data[f"traj_{eps['episode_id']}"]
+        trajectory = load_h5_data(trajectory)
+            # # convert the original raw observation with our batch-aware function
+        obs = convert_observation(trajectory["obs"])
+            # # we use :-1 to ignore the last obs as terminal observations are included
+            # # and they don't have actions
+        rgb = obs["rgb"][step_id]
+        state = obs["state"][step_id]
+        action = trajectory["actions"][step_id]
+
+        return rgb, state, action
 
     def __getitem__(self, idx):
-        action = th.from_numpy(self.actions[idx]).float()
-        rgbd = self.obs_rgbd[idx]
+        obj_id, trj_id, step_id = self.compute_idx(idx)
+        rgb, state, action = self.load_step(obj_id, trj_id, step_id)
+        action = th.from_numpy(action).float()
         # note that we rescale data on demand as opposed to storing the rescaled data directly
         # so we can save a ton of space at the cost of a little extra compute
-        rgbd = rescale_rgbd(rgbd)
+        rgb = rescale_rgbd(rgb)
         # permute data so that channels are the first dimension as PyTorch expects this
-        rgbd = th.from_numpy(rgbd).float().permute((2, 0, 1))
-        state = th.from_numpy(self.obs_state[idx]).float()
-        return dict(rgbd=rgbd, state=state), action
+        rgb = th.from_numpy(rgb).float().permute((2, 0, 1))
+        state = th.from_numpy(state).float()
+        return dict(rgb=rgb, state=state), action
 
 
 class NatureCNN(nn.Module):
@@ -251,7 +298,7 @@ def main():
         output_dir=osp.join(log_dir, "eval_videos" if args.eval else "videos"),
         info_on_video=True,
     )
-    dataset = ManiSkill2Dataset(demo_path)
+    # dataset = ManiSkill2Dataset(demo_path)
     if args.eval:
         model_path = args.model_path
         if model_path is None:
@@ -272,12 +319,12 @@ def main():
             shuffle=True,
         )
         obs, action = dataset[0]
-        print("RGBD:", obs["rgbd"].shape)
+        print("RGBD:", obs["rgb"].shape)
         print("State:", obs["state"].shape)
         print("Action:", action.shape)
         # create our policy
         obs, action = dataset[0]
-        rgbd_shape = obs["rgbd"].shape
+        rgbd_shape = obs["rgb"].shape
         th.manual_seed(0)
         policy = Policy(
             image_size=rgbd_shape[1:],
@@ -321,11 +368,11 @@ def main():
         while i < num_episodes:
             # convert observation to our desired shape, rescale correctly, and move to appropriate device
             obs = convert_observation(obs)
-            obs["rgbd"] = rescale_rgbd(obs["rgbd"], scale_rgb_only=True)
+            obs["rgb"] = rescale_rgbd(obs["rgb"], scale_rgb_only=True)
             obs_device = dict()
             # unsqueeze adds an extra batch dimension and we permute rgbd since PyTorch expects the channel dimension to be first
-            obs_device["rgbd"] = (
-                th.from_numpy(obs["rgbd"])
+            obs_device["rgb"] = (
+                th.from_numpy(obs["rgb"])
                 .float()
                 .permute(2, 0, 1)
                 .unsqueeze(0)

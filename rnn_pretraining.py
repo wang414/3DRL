@@ -2,7 +2,7 @@ import argparse
 import os.path as osp
 from functools import partial
 import json, os, time
-import sys
+import sys, shutil
 from icecream import ic
 import mani_skill2.envs
 import gymnasium as gym
@@ -216,7 +216,8 @@ class CustomExtractor(BaseFeaturesExtractor):
 
 class RewardCallback:
     def __init__(self, K, n_envs, max_episode_len, pointnet_path='/home/lab/ManiSkill2/Pointnet2_PyTorch/outputs/cls-ssg-xyz/epoch=16-val_loss=0.36-val_acc=0.885.ckpt', stride=5):
-        os.system(f'rm -rf .tmp && mkdir .tmp')
+        if not os.path.exists('.tmp'):
+            os.system(f'mkdir .tmp')
         self.K = K
         self.stride = stride
         # self.model = PointNet2ClassificationSSG({'model.use_xyz':True})
@@ -239,6 +240,7 @@ class RewardCallback:
         self.masks_buf = [[] for _ in range(n_envs)]
         self.dep_buf = [[] for _ in range(n_envs)]
         self.obj_buf = [[] for _ in range(n_envs)]
+        self.time = time.time()
 
     def cosine_similarity(self, vector1, vector2):
         # print(vector1.shape)
@@ -254,18 +256,18 @@ class RewardCallback:
         if cat_sam == 0:
             st = 0
         elif cat_sam == 1:
-            st = 15
+            st = 10
         elif cat_sam == 2:
-            st = 30   
+            st = 20   
         if cat_sam == 3:
             st = 0
             ed = len
         else:
-            ed = min(len, st+20)
+            ed = min(len, st+30)
         l = np.arange(st, ed)
         np.random.shuffle(l)
         l = l[:10]
-        l = np.sort(l)
+        # l = np.sort(l)
         return l
 
     @staticmethod
@@ -350,7 +352,7 @@ class RewardCallback:
             for i in range(idx*stride, idx*stride + stride):
                 if rollout_buffer.episode_starts[t, i] and t > 0:
                     rw, bs = self.compute(np.array(self.rgb_buf[i]), np.array(self.dep_buf[i]),
-                            np.array(self.masks_buf[i], dtype=np.uint8), self.obj_buf[i][0], tmp_dir=f'./.tmp/{idx}')
+                            np.array(self.masks_buf[i], dtype=np.uint8), self.obj_buf[i][0], tmp_dir=f'./.tmp/{self.time}.{idx}')
                     with lock:
                         self.reset_buf(i)
                         rollout_buffer.rewards[t-1, i] = rw
@@ -359,7 +361,7 @@ class RewardCallback:
                               rollout_buffer.observations['mask'][t,i], i)
                 if t+1 == rollout_buffer.buffer_size and len(self.rgb_buf[i]) == self.max_episode_len:
                     rw, bs = self.compute(np.array(self.rgb_buf[i]), np.array(self.dep_buf[i]), 
-                            np.array(self.masks_buf[i], dtype=np.uint8), self.obj_buf[i][0], tmp_dir=f'./.tmp/{idx}')
+                            np.array(self.masks_buf[i], dtype=np.uint8), self.obj_buf[i][0], tmp_dir=f'./.tmp/{self.time}.{idx}')
                     with lock:
                         self.reset_buf(i)
                         rollout_buffer.rewards[t, i] = rw
@@ -445,6 +447,9 @@ def parse_args():
     parser.add_argument(
         '--finite', action='store_false', help="train with finity setting"
     )
+    parser.add_argument(
+        "--train_subset", action='store_true' 
+    )
     args = parser.parse_args()
     return args
 
@@ -457,12 +462,19 @@ def main():
     log_dir = args.log_dir
     max_episode_steps = args.max_episode_steps
     total_timesteps = args.total_timesteps
-    rollout_steps = 3200
+    rollout_steps = 1600
 
     obs_mode = ["rgbd", "obj_seg"]
     # NOTE: The end-effector space controller is usually more friendly to pick-and-place tasks
     control_mode = "pd_ee_delta_pose"
     use_ms2_vec_env = False
+
+    objs = None
+    if args.train_subset:
+        with open('trainobj.json', 'r') as f:
+            objs = json.load(f)
+        print("training objects:")
+        print(objs)
 
     if args.seed is not None:
         set_random_seed(args.seed)
@@ -475,15 +487,25 @@ def main():
     ):
         # NOTE: Import envs here so that they are registered with gym in subprocesses
         import mani_skill2.envs
-
-        env = gym.make(
-            env_id,
-            obs_mode=obs_mode,
-            control_mode=control_mode,
-            render_mode="cameras",
-            max_episode_steps=max_episode_steps,
-            camera_cfgs={'add_segmentation': True},
-        )
+        if args.train_subset:
+            env = gym.make(
+                env_id,
+                obs_mode=obs_mode,
+                control_mode=control_mode,
+                render_mode="cameras",
+                max_episode_steps=max_episode_steps,
+                camera_cfgs={'add_segmentation': True},
+                model_ids=objs
+            )
+        else:
+            env = gym.make(
+                env_id,
+                obs_mode=obs_mode,
+                control_mode=control_mode,
+                render_mode="cameras",
+                max_episode_steps=max_episode_steps,
+                camera_cfgs={'add_segmentation': True},
+            )
         # For training, we regard the task as a continuous task with infinite horizon.
         # you can use the ContinuousTaskWrapper here for that
         if max_episode_steps is not None:
@@ -560,10 +582,16 @@ def main():
         tensorboard_log=log_dir,
         policy_kwargs=policy_kwargs,
         learning_rate=1e-4,
+        norm_coef=5e-5,
         # ent_coef=1e-3,
         # verbose=1,
     )
-
+    current_file = os.path.abspath(__file__)
+    backup_file = osp.join(log_dir,"run_file.py")
+    shutil.copy(current_file, backup_file)
+    par_file = osp.join(log_dir, 'args.json')
+    with open(par_file, 'w') as f:
+        json.dump(vars(args), f, indent=4)
     if args.eval:
         model_path = args.model_path
         if model_path is None:
