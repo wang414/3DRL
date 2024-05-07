@@ -249,6 +249,9 @@ def parse_args():
     parser.add_argument(
         "--policy_only", action="store_true"
     )
+    parser.add_argument(
+        "--train_subset", action='store_true' 
+    )
     args = parser.parse_args()
     return args
 
@@ -268,6 +271,13 @@ def main():
     control_mode = "pd_ee_delta_pose"
     use_ms2_vec_env = False
 
+    objs = None
+    if args.train_subset:
+        with open('trainobj.json', 'r') as f:
+            objs = json.load(f)
+        print("training objects:")
+        print(objs)
+
     if args.seed is not None:
         set_random_seed(args.seed)
 
@@ -280,13 +290,25 @@ def main():
         # NOTE: Import envs here so that they are registered with gym in subprocesses
         import mani_skill2.envs
 
-        env = gym.make(
-            env_id,
-            obs_mode=obs_mode,
-            control_mode=control_mode,
-            render_mode="cameras",
-            max_episode_steps=max_episode_steps,
-        )
+        if args.train_subset:
+            env = gym.make(
+                env_id,
+                obs_mode=obs_mode,
+                control_mode=control_mode,
+                render_mode="cameras",
+                max_episode_steps=max_episode_steps,
+                camera_cfgs={'add_segmentation': True},
+                model_ids=objs
+            )
+        else:
+            env = gym.make(
+                env_id,
+                obs_mode=obs_mode,
+                control_mode=control_mode,
+                render_mode="cameras",
+                max_episode_steps=max_episode_steps,
+                camera_cfgs={'add_segmentation': True},
+            )
         # For training, we regard the task as a continuous task with infinite horizon.
         # you can use the ContinuousTaskWrapper here for that
         if max_episode_steps is not None:
