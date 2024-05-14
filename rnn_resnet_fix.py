@@ -1,24 +1,22 @@
+# Import required packages
 import argparse
 import os.path as osp
 from functools import partial
-import json, os, time
-import sys, shutil
-from icecream import ic
-import mani_skill2.envs
+
 import gymnasium as gym
 import gymnasium.spaces as spaces
 import numpy as np
 import torch as th
 import torch.nn as nn
-import torch.nn.functional as F
 # from stable_baselines3 import PPO
-from module.pretrain_ppo import RecurrentPPO
+from module.recurrent_ppo import RecurrentPPO
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
-from PIL import Image
+
+import mani_skill2.envs
 from mani_skill2.utils.common import flatten_dict_space_keys, flatten_state_dict
 from mani_skill2.utils.wrappers import RecordEpisode
 from mani_skill2.vector import VecEnv
@@ -26,10 +24,8 @@ from mani_skill2.vector import make as make_vec_env
 from mani_skill2.vector.vec_env import VecEnvObservationWrapper
 from mani_skill2.vector.wrappers.sb3 import SB3VecEnvWrapper
 from torchvision.models import resnet18
-# from pointnet2.models.pointnet2_ssg_cls import PointNet2ClassificationSSG
-import open3d as o3d
-import subprocess, threading
-from PyTorchEMD import earth_mover_distance
+
+
 # Defines a continuous, infinite horizon, task where terminated is always False
 # unless a timelimit is reached.
 class ContinuousTaskWrapper(gym.Wrapper):
@@ -52,9 +48,10 @@ class SuccessInfoWrapper(gym.Wrapper):
         return ob, rew, terminated, truncated, info
 
 
-class PretrainWrapper(gym.ObservationWrapper):
+class ManiSkillRGBDWrapper(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
+        assert env.obs_mode == "rgbd"
         self.observation_space = self.init_observation_space(env.observation_space)
 
     @staticmethod
@@ -68,7 +65,6 @@ class PretrainWrapper(gym.ObservationWrapper):
         state_size = sum([space.shape[0] for space in state_spaces])
         state_space = spaces.Box(-np.inf, np.inf, shape=(state_size,))
 
-
         # Concatenate all the image spaces
         image_shapes = []
         for cam_uid in obs_space["image"]:
@@ -79,16 +75,10 @@ class PretrainWrapper(gym.ObservationWrapper):
         assert np.all(image_shapes[0, :2] == image_shapes[:, :2]), image_shapes
         h, w = image_shapes[0, :2]
         c = image_shapes[:, 2].sum(0)
-        rgb_space = spaces.Box(0, np.inf, shape=(h, w, c))
-        
-        # depth_space and mask space
-        mask_space = spaces.Box(0, 255, shape=(h, w, 1), dtype=bool)
-        depth_space = spaces.Box(-np.inf, np.inf, shape=(h, w, 1))
+        rgbd_space = spaces.Box(0, np.inf, shape=(h, w, c))
 
         # Create the new observation space
-        return spaces.Dict({"rgb": rgb_space, "depth":depth_space, "mask":mask_space, "state": state_space})
-        # return spaces.Dict({"rgb": rgb_space, "depth":depth_space, "mask":mask_space, "state": state_space})
-
+        return spaces.Dict({"rgb": rgbd_space, "state": state_space})
 
     @staticmethod
     def convert_observation(observation):
@@ -109,7 +99,7 @@ class PretrainWrapper(gym.ObservationWrapper):
             # images.append(depth)
 
         # Concatenate all the images
-        rgb = np.concatenate(images, axis=-1)
+        rgbd = np.concatenate(images, axis=-1)
 
         # Concatenate all the states
         state = np.hstack(
@@ -119,29 +109,29 @@ class PretrainWrapper(gym.ObservationWrapper):
             ]
         )
 
-        depth = observation["image"]["hand_camera"]["depth"]
-        mask = observation["image"]["hand_camera"]["obj_seg"]
-        if isinstance(depth, th.Tensor):
-            depth = depth.to(device="cpu", non_blocking=True)
-        return dict(rgb=rgb, depth=depth, mask=mask, state=state)
+        return dict(rgb=rgbd, state=state)
 
     def observation(self, observation):
         return self.convert_observation(observation)
 
+
+# We separately define an VecEnv observation wrapper for the ManiSkill VecEnv
+# as the gpu optimization makes it incompatible with the SB3 wrapper
 class ManiSkillRGBDVecEnvWrapper(VecEnvObservationWrapper):
     def __init__(self, env):
-        # assert env.obs_mode == "rgbd"
+        assert env.obs_mode == "rgbd"
         # we simply define the single env observation space. The inherited wrapper automatically computes the batched version
-        single_observation_space = PretrainWrapper.init_observation_space(
+        single_observation_space = ManiSkillRGBDWrapper.init_observation_space(
             env.single_observation_space
         )
         super().__init__(env, single_observation_space)
 
     def observation(self, observation):
-        return PretrainWrapper.convert_observation(observation)
+        return ManiSkillRGBDWrapper.convert_observation(observation)
+
 
 class CustomExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict, emb_module='CNN'):
+    def __init__(self, observation_space: gym.spaces.Dict, emb_module='resnet'):
         super().__init__(observation_space, features_dim=1)
         extractors = {}
         assert emb_module in ['CNN', 'resnet'], 'embedding module not define'
@@ -182,19 +172,25 @@ class CustomExtractor(BaseFeaturesExtractor):
                         nn.ReLU(),
                         nn.Flatten(),
                     )
+                    # to easily figure out the dimensions after flattening, we pass a test tensor
+                    test_tensor = th.zeros(
+                        [subspace.shape[2], subspace.shape[0], subspace.shape[1]]
+                    )
+                    with th.no_grad():
+                        n_flatten = cnn(test_tensor[None]).shape[1]
+                    fc = nn.Sequential(nn.Linear(n_flatten, feature_size), nn.ReLU())
+                    extractors["rgb"] = nn.Sequential(cnn, fc)
                 if emb_module == 'resnet':
-                    cnn = resnet18(pretrained=True)
-                    cnn.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-                    num_ftrs = cnn.fc.in_features
-                    cnn.fc = nn.Linear(num_ftrs, feature_size)    
-                # to easily figure out the dimensions after flattening, we pass a test tensor
-                test_tensor = th.zeros(
-                    [subspace.shape[2], subspace.shape[0], subspace.shape[1]]
-                )
-                with th.no_grad():
-                    n_flatten = cnn(test_tensor[None]).shape[1]
-                fc = nn.Sequential(nn.Linear(n_flatten, feature_size), nn.ReLU())
-                extractors["rgb"] = nn.Sequential(cnn, fc)
+                    cnn1 = resnet18(pretrained=True)
+                    cnn2 = resnet18(pretrained=True)
+                    num_ftrs = cnn1.fc.in_features
+                    cnn1.fc = nn.Linear(num_ftrs, feature_size//2)    
+                    cnn2.fc = nn.Linear(num_ftrs, feature_size//2)    
+                    cnn1.requires_grad_(False)
+                    cnn2.requires_grad_(False)
+                    cnn1.fc.requires_grad_(True)
+                    cnn1.fc.requires_grad_(True)
+                    extractors["rgb"] = nn.ModuleList([nn.Sequential(cnn1, nn.ReLU()), nn.Sequential(cnn2, nn.ReLU())])
                 total_concat_size += feature_size
             elif key == "state":
                 # for state data we simply pass it through a single linear layer
@@ -210,198 +206,12 @@ class CustomExtractor(BaseFeaturesExtractor):
         for key, extractor in self.extractors.items():
             if key == "rgb":
                 observations[key] = observations[key].permute((0, 3, 1, 2))
-            encoded_tensor_list.append(extractor(observations[key]))
+                encoded_tensor_list.append(extractor[0](observations[key][:,:3,:,:]))
+                encoded_tensor_list.append(extractor[1](observations[key][:,3:,:,:]))
+            else:
+                encoded_tensor_list.append(extractor(observations[key]))
         # Return a (B, self._features_dim) PyTorch tensor, where B is batch dimension.
         return th.cat(encoded_tensor_list, dim=1)
-
-class RewardCallback:
-    def __init__(self, K, n_envs, max_episode_len, pointnet_path='/home/lab/ManiSkill2/Pointnet2_PyTorch/outputs/cls-ssg-xyz/epoch=16-val_loss=0.36-val_acc=0.885.ckpt', stride=5):
-        if not os.path.exists('.tmp'):
-            os.system(f'mkdir .tmp')
-        self.K = K
-        self.stride = stride
-        # self.model = PointNet2ClassificationSSG({'model.use_xyz':True})
-        # self.model.load_from_checkpoint(pointnet_path)
-        # self.model = self.model.to('cuda')
-        # self.model.eval()
-        with open('data/mani_skill2_ycb/info_pick_v0.json', 'r') as f:
-            obj_dict = json.load(f)
-        data_dir = 'data/mani_skill2_ycb/models'
-        self.gt_pcds = {}
-        for key in obj_dict.keys():
-            pcd_dir = os.path.join(data_dir, key, 'pcd.ply')
-            pcd = o3d.io.read_point_cloud(pcd_dir)
-            pcd = self.normalize_point_cloud(pcd)
-            pcd = np.asarray(pcd.points, dtype=np.float32)
-            self.gt_pcds[key] = pcd
-        self.n_envs = n_envs
-        self.max_episode_len = max_episode_len
-        self.rgb_buf = [[] for _ in range(n_envs)]
-        self.masks_buf = [[] for _ in range(n_envs)]
-        self.dep_buf = [[] for _ in range(n_envs)]
-        self.obj_buf = [[] for _ in range(n_envs)]
-        self.time = time.time()
-
-    def cosine_similarity(self, vector1, vector2):
-        # print(vector1.shape)
-        vector1 = vector1.squeeze(-1)
-        vector2 = vector2.squeeze(-1)
-        similarity = F.cosine_similarity(vector1, vector2, dim=1)
-        return similarity.item()
-
-    def sample_idx(self, len):
-        # print(len)
-        cat_sam = np.random.choice(4, p=[0.3,0.3,0.3,0.1])
-        # 0-20 15
-        if cat_sam == 0:
-            st = 0
-        elif cat_sam == 1:
-            st = 10
-        elif cat_sam == 2:
-            st = 20   
-        if cat_sam == 3:
-            st = 0
-            ed = len
-        else:
-            ed = min(len, st+30)
-        l = np.arange(st, ed)
-        np.random.shuffle(l)
-        l = l[:10]
-        l = np.sort(l)
-        return l
-
-    @staticmethod
-    def normalize_point_cloud(pc):
-        centroid = pc.get_center()
-        pc.translate(-centroid)
-        distances = np.asarray(pc.points)
-        max_distance = np.max(np.linalg.norm(distances, axis=1))
-        # print(max_distance)
-        pc.scale(1 / max_distance, center=pc.get_center())
-        return pc
-
-    def compute(self, rgbs, depths, masks, obj, tmp_dir = './.tmp'):
-        
-        # start_time = time.time()
-        os.system(f'rm -rf {tmp_dir} && mkdir {tmp_dir}')
-        os.system(f"mkdir {os.path.join(tmp_dir, 'input')}")
-        depths = depths.squeeze(-1)
-        masks = masks.squeeze(-1)
-        mask_rew = masks.sum()*5/(128*128)
-        mask_rew_clip = max(min(mask_rew, 5), 0)
-        mask_rew_clip = 0
-        idxs = self.sample_idx(rgbs.shape[0])
-        # print(idxs)
-        rgbs = (rgbs[idxs,:,:,3:] * 255).astype(np.uint8)
-        depths = depths[idxs]
-        masks = masks[idxs].astype(np.uint8)
-        np.savez(os.path.join(tmp_dir, 'input', 'input.npz'), rgbs=rgbs, depths=depths, masks=masks, K=self.K)
-        # pcd = run_one_video(manireader, tmp_dir)
-        # import time
-        # time.sleep(0.5)
-        command = f"python bundlesdf_runner.py --input_file {os.path.join(tmp_dir, 'input', 'input.npz')} --output_folder {os.path.join(tmp_dir, 'result')} --unit 1"
-        process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True)
-        process.wait()
-        # finish1_time = time.time()
-        pcd_path = os.path.join(tmp_dir,'result','nerf_with_bundletrack_online', 'naive_fusion_biggest_cluster.ply')
-        build_succ = True
-        if os.path.exists(pcd_path):
-            pcd = o3d.io.read_point_cloud(pcd_path)
-            pcd = self.normalize_point_cloud(pcd)
-            gt_pcd_np = self.gt_pcds[obj]
-            gt_pcd = o3d.geometry.PointCloud()
-            gt_pcd.points = o3d.utility.Vector3dVector(gt_pcd_np)
-            chamfer_dis = pcd.compute_point_cloud_distance(gt_pcd)
-            chamfer_dis = np.asarray(chamfer_dis).sum().item()
-            # pcd = np.asarray(pcd.points, dtype=np.float32)
-            # pcd = th.tensor(pcd, device='cuda').unsqueeze(0)
-            # gt_pcd = th.tensor(np.asarray(self.gt_pcds[obj]), device='cuda', dtype=th.float32).unsqueeze(0)
-            # emd_dis = earth_mover_distance(pcd, gt_pcd)
-            # ic(chamfer_dis)
-            # ic(emd_dis)
-            # print(chamfer_dis)
-            clip_dis_reward = max(min(20 - chamfer_dis*10, 20), 0)
-            # clip_dis_reward = max(min(20 - emd_dis*10, 20), 0)
-
-        else:
-            clip_dis_reward = 0
-            build_succ = False
-        # finish2_time = time.time()
-        # print(f'construct_time = {finish1_time-start_time}')
-        # print(f'dis_time = {finish2_time-finish1_time}')
-        return clip_dis_reward+mask_rew_clip, build_succ
-        # return 10 - clip_dis, build_succ
-    
-    def reset_buf(self, idx):
-        self.rgb_buf[idx] = []
-        self.masks_buf[idx] = []
-        self.dep_buf[idx] = []
-        self.obj_buf[idx].pop(0)
-
-    def add_obj(self, obj, idx):
-        self.obj_buf[idx].append(obj)
-
-    def add_buf(self, rgb, dep, mask, idx):
-        self.rgb_buf[idx].append(rgb)
-        self.masks_buf[idx].append(mask)
-        self.dep_buf[idx].append(dep)
-
-    def multi_thread_task(self, rollout_buffer, idx, stride, lock):
-        for t in range(rollout_buffer.buffer_size):
-            # ic(rollout_buffer.episode_starts[t])
-            for i in range(idx*stride, idx*stride + stride):
-                if rollout_buffer.episode_starts[t, i] and t > 0:
-                    rw, bs = self.compute(np.array(self.rgb_buf[i]), np.array(self.dep_buf[i]),
-                            np.array(self.masks_buf[i], dtype=np.uint8), self.obj_buf[i][0], tmp_dir=f'./.tmp/{self.time}.{idx}')
-                    with lock:
-                        self.reset_buf(i)
-                        rollout_buffer.rewards[t-1, i] = rw
-                        self.total_bs += bs
-                self.add_buf(rollout_buffer.observations['rgb'][t,i], rollout_buffer.observations['depth'][t,i],
-                              rollout_buffer.observations['mask'][t,i], i)
-                if t+1 == rollout_buffer.buffer_size and len(self.rgb_buf[i]) == self.max_episode_len:
-                    rw, bs = self.compute(np.array(self.rgb_buf[i]), np.array(self.dep_buf[i]), 
-                            np.array(self.masks_buf[i], dtype=np.uint8), self.obj_buf[i][0], tmp_dir=f'./.tmp/{self.time}.{idx}')
-                    with lock:
-                        self.reset_buf(i)
-                        rollout_buffer.rewards[t, i] = rw
-                        self.total_bs += bs
-                    
-
-    def __call__(self, rollout_buffer):
-        rollout_buffer.rewards *= 0
-        self.total_bs = 0
-        threads = []
-        lock = threading.Lock()
-        for i in range(8):
-            t = threading.Thread(target=self.multi_thread_task, args=(rollout_buffer, i, 1, lock))
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
-        th.cuda.empty_cache()
-        return self.total_bs
-
-    def single_thread(self, rollout_buffer):  
-        # ic(rollout_buffer.buffer_size)
-        rollout_buffer.rewards *= 0
-        self.total_bs = 0
-        for t in range(rollout_buffer.buffer_size):
-            # ic(rollout_buffer.episode_starts[t])
-            for i in range(rollout_buffer.n_envs):
-                if rollout_buffer.episode_starts[t, i] and t > 0:
-                    rollout_buffer.rewards[t-1, i], bs = self.compute(np.array(self.rgb_buf[i]), np.array(self.dep_buf[i]),
-                                        np.array(self.masks_buf[i], dtype=np.uint8), self.obj_buf[i][0])
-                    self.reset_buf(i)
-                    self.total_bs += bs
-                self.add_buf(rollout_buffer.observations['rgb'][t,i], rollout_buffer.observations['depth'][t,i],
-                              rollout_buffer.observations['mask'][t,i], i)
-                if t+1 == rollout_buffer.buffer_size and len(self.rgb_buf[i]) == self.max_episode_len:
-                    rollout_buffer.rewards[t, i], bs = self.compute(np.array(self.rgb_buf[i]), np.array(self.dep_buf[i]), 
-                                        np.array(self.masks_buf[i], dtype=np.uint8), self.obj_buf[i][0])
-                    self.reset_buf(i)
-                    self.total_bs += bs
-        return self.total_bs
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -444,12 +254,6 @@ def parse_args():
     parser.add_argument(
         "--model-path", type=str, help="path to sb3 model for evaluation"
     )
-    parser.add_argument(
-        '--finite', action='store_false', help="train with finity setting"
-    )
-    parser.add_argument(
-        "--train_subset", action='store_true' 
-    )
     args = parser.parse_args()
     return args
 
@@ -462,19 +266,12 @@ def main():
     log_dir = args.log_dir
     max_episode_steps = args.max_episode_steps
     total_timesteps = args.total_timesteps
-    rollout_steps = 1600
+    rollout_steps = 3200
 
-    obs_mode = ["rgbd", "obj_seg"]
+    obs_mode = "rgbd"
     # NOTE: The end-effector space controller is usually more friendly to pick-and-place tasks
     control_mode = "pd_ee_delta_pose"
     use_ms2_vec_env = False
-
-    objs = None
-    if args.train_subset:
-        with open('trainobj.json', 'r') as f:
-            objs = json.load(f)
-        print("training objects:")
-        print(objs)
 
     if args.seed is not None:
         set_random_seed(args.seed)
@@ -487,30 +284,19 @@ def main():
     ):
         # NOTE: Import envs here so that they are registered with gym in subprocesses
         import mani_skill2.envs
-        if args.train_subset:
-            env = gym.make(
-                env_id,
-                obs_mode=obs_mode,
-                control_mode=control_mode,
-                render_mode="cameras",
-                max_episode_steps=max_episode_steps,
-                camera_cfgs={'add_segmentation': True},
-                model_ids=objs
-            )
-        else:
-            env = gym.make(
-                env_id,
-                obs_mode=obs_mode,
-                control_mode=control_mode,
-                render_mode="cameras",
-                max_episode_steps=max_episode_steps,
-                camera_cfgs={'add_segmentation': True},
-            )
+
+        env = gym.make(
+            env_id,
+            obs_mode=obs_mode,
+            control_mode=control_mode,
+            render_mode="cameras",
+            max_episode_steps=max_episode_steps,
+        )
         # For training, we regard the task as a continuous task with infinite horizon.
         # you can use the ContinuousTaskWrapper here for that
         if max_episode_steps is not None:
             env = ContinuousTaskWrapper(env)
-        env = PretrainWrapper(env)
+        env = ManiSkillRGBDWrapper(env)
         # For evaluation, we record videos
         if record_dir is not None:
             env = SuccessInfoWrapper(env)
@@ -531,7 +317,6 @@ def main():
         make_env,
         env_id,
         record_dir=record_dir,
-        max_episode_steps = max_episode_steps
     )
     eval_env = SubprocVecEnv([env_fn for _ in range(1)])
     eval_env = VecMonitor(eval_env)  # Attach a monitor to log episode info
@@ -556,6 +341,7 @@ def main():
                 env
             )  # makes MS2VecEnvs compatible with SB3. It's equivalent to SubprocVecEnv
         else:
+            print('use second vec method')
             env_fn = partial(
                 make_env,
                 env_id,
@@ -570,28 +356,19 @@ def main():
     policy_kwargs = dict(
         features_extractor_class=CustomExtractor, net_arch=[256, 128], log_std_init=-0.5
     )
-    ic('prepare to setup PPO')
     model = RecurrentPPO(
         "MultiInputLstmPolicy",
         env,
         n_steps=rollout_steps // num_envs,
         batch_size=400,
         n_epochs=5,
-        gamma=0.99,
+        gamma=0.8,
         target_kl=0.2,
         tensorboard_log=log_dir,
         policy_kwargs=policy_kwargs,
-        learning_rate=1e-4,
-        norm_coef=5e-5,
-        # ent_coef=1e-3,
-        # verbose=1,
+        verbose=1,
     )
-    current_file = os.path.abspath(__file__)
-    backup_file = osp.join(log_dir,"run_file.py")
-    shutil.copy(current_file, backup_file)
-    par_file = osp.join(log_dir, 'args.json')
-    with open(par_file, 'w') as f:
-        json.dump(vars(args), f, indent=4)
+
     if args.eval:
         model_path = args.model_path
         if model_path is None:
@@ -601,23 +378,20 @@ def main():
     else:
         # Define callbacks to periodically save our model and evaluate it to help monitor training
         checkpoint_callback = CheckpointCallback(
-            save_freq=10 * rollout_steps // num_envs,
+            save_freq=50 * rollout_steps // num_envs,
             save_path=log_dir,
-            verbose=2
         )
         eval_callback = EvalCallback(
             eval_env,
-            eval_freq=10 * rollout_steps // num_envs,
+            eval_freq=50 * rollout_steps // num_envs,
             log_path=log_dir,
             best_model_save_path=log_dir,
             deterministic=True,
             render=False,
         )
-        K = np.array([[64,0,64],[0,64,64],[0,0,1]], dtype=np.float32)
-        reward_callback = RewardCallback(K, num_envs, max_episode_steps)
-        # reward_callback = None
+
         # Train an agent with PPO
-        model.learn(total_timesteps, log_interval=10, callback=[checkpoint_callback, eval_callback], reward_callback=reward_callback)
+        model.learn(total_timesteps, log_interval=50, callback=[checkpoint_callback, eval_callback])
         # Save the final model
         model.save(osp.join(log_dir, "latest_model"))
 
@@ -628,7 +402,7 @@ def main():
         deterministic=True,
         render=False,
         return_episode_rewards=True,
-        n_eval_episodes=5,
+        n_eval_episodes=10,
     )
     print("Returns", returns)
     print("Episode Lengths", ep_lens)
